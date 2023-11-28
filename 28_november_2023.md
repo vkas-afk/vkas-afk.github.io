@@ -291,7 +291,7 @@ for i in range(initial_delay-2, initial_delay+2):
 ##### Video of the Exploit Running 
 The video is sped up 5x because the PoC took upwards of roughly 6 minutes to run in the virtual machine.
 
-![image](/28_november_2023.webm)
+![image](/28_november_2023.gif)
 
 ### Disclosure Timeline 
 - 18/11/2020 - First Contact 
