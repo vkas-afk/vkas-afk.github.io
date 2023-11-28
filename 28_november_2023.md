@@ -80,7 +80,7 @@ void AppDelegate::applicationDidFinishLaunching:(ID param_1,SEL param_2,ID param
 
   ...
   shared_folder_path_str = [NSSTRING stringWithUTF8String:"/Users/Shared/GOG.com/Galaxy"];
-  manager = [NSFileManager defaultManager];``
+  manager = [NSFileManager defaultManager];
   is_dir = 0;
   dir_exists = [manager fileExistsAtPath:path_str isDirectory:&is_dir];
   if(dir_exits)
